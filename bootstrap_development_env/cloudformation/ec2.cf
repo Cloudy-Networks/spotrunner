@@ -1,0 +1,266 @@
+
+Parameters:
+
+  FtS3BucketNameParameter:
+    Description: s3 bucket to get deploys from.
+    Type: String
+    Default: spotrunner.ig.dev
+
+  InstanceOperatingSystemParameter:
+    Description: Choose an operating system. The AMI must be registered in
+                  in your account and region.
+    Type: String
+    Default: Debian10
+    AllowedValues:
+      - Debian10
+      - Ubuntu20
+      - AmazonLinux2
+
+  InstanceTypeParameter:
+    Description: Instance types are t3.micro(2c,1g) t2.micro(1c,1g) t3.small(2c,2g) t2.small(1c,2g).
+                 The default is t3.micro. The t2 and t3.micro types are eligable for the free tier.
+                 The t2 and t3.small are not, but are the next cheapest choice if higher CPU and RAM are needed.
+                 See https://aws.amazon.com/ec2/pricing/on-demand/ for latest pricing.
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+      - t3.small
+      - t2.small
+
+  KeyNameParameter:
+    Description: The EC2 Key Pair to allow SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+
+  DeployNameParameter:
+    Description: Choose a deploy to run on your host.
+    Type: String
+    Default: deploy.sh
+    AllowedValues:
+      - deploy.sh
+
+
+  HostNameParamter:
+    Description: Enter the host name of your instance.
+    Type: String
+    Default: www
+
+# Mappings... proof of concept, specify the "OS code"
+# and get the image based on the region you are deploying in
+# use it as a parameter for EC2 like:
+#
+# ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", Debian10]
+#
+# Debian10 == Debian 10 Buster
+# Ubuntu20 == Ubuntu 20.04 LTS Focal
+# AmazonLinux2 == Amazon Linux 2
+#
+# delete these comments later...
+
+Mappings:
+  RegionMap:
+    us-west-1:
+      Debian10: ami-0f410b552d8a5e1b9
+      Ubuntu20: ami-0085e120cd494ce88
+      AmazonLinux2: ami-00db7974d178c2536
+    us-west-2:
+      Debian10: ami-01632a514f93db17f
+      Ubuntu20: ami-024f7e9a6b4357656
+      AmazonLinux2: ami-0d927e3ac55a7b26f
+    us-east-1:
+      Debian10: ami-00bc4a48c20aeae77
+      Ubuntu20: ami-089439860addda2e3
+      AmazonLinux2: ami-0dc161e2e5f144ffc
+    us-east-2:
+      Debian10: ami-05f5cd6454a382a70
+      Ubuntu20: ami-0ef6adb08833904f8
+      AmazonLinux2: ami-09f644e1caad2d877
+
+Resources:
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.1.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value:  !Join ['', [!Ref "AWS::StackName", "-cloudynet" ]]
+
+  #  VPC gets internet access:
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-InternetGateway
+    DependsOn: VPC
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    # Note, you can't attach an IGW to a VPC unless both are created:
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicNet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 192.168.1.0/28
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-PublicNet1
+
+  # Some route tables for our subnets:
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-PublicRouteTable
+
+  PublicRoute1:   # Public route table has direct routing to IGW:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # A NAT Gateway:
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt VPCElasticIPAddress.AllocationId
+      SubnetId: !Ref PublicNet1
+
+  VPCElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: VPC
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-VPCElasticIPAddress
+
+  # Attach the public subnet to public route table:
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicNet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Let clients connect from anywhere on the standard OA udp port.
+  # Let admins connect from anywhere via ssh
+  SecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow clients into the-oa
+        SecurityGroupEgress:
+            - IpProtocol: -1
+              CidrIp: 0.0.0.0/0
+        SecurityGroupIngress:
+            - IpProtocol: tcp
+              FromPort: 22
+              ToPort: 22
+              CidrIp: 0.0.0.0/0
+            - IpProtocol: tcp
+              FromPort: 80
+              ToPort: 80
+              CidrIp: 0.0.0.0/0
+            - IpProtocol: tcp
+              FromPort: 443
+              ToPort: 443
+              CidrIp: 0.0.0.0/0
+        Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-SecurityGroup
+        VpcId: !Ref VPC
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      DisableApiTermination: false
+      IamInstanceProfile: !Ref EC2S3RoleInstanceProfile # Allow OA host to access to s3 bucket object "server.cfg".
+      InstanceInitiatedShutdownBehavior: stop
+      InstanceType: !Ref InstanceTypeParameter
+      ImageId: !FindInMap [ RegionMap, !Ref "AWS::Region", !Ref InstanceOperatingSystemParameter ]
+      KeyName: !Ref KeyNameParameter
+      Monitoring: no
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref PublicNet1
+          GroupSet: [ !Ref SecurityGroup ] # Plug in the security group
+      Tags:
+      - Key: Name
+        Value: !Sub ${AWS::StackName}-EC2Instance
+      UserData:
+        "Fn::Base64":
+            "Fn::Sub": |
+              #!/bin/bash
+              aws s3 cp s3://${FtS3BucketNameParameter}/${DeployNameParameter} - | bash -s
+
+# How to get and allocate a "new" EIP and associate it to an instance
+  EC2InstanceEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      InstanceId: !Ref EC2Instance
+    DependsOn: EC2Instance
+
+# Example of how to allocate an EIP already in your account
+#  EC2InstanceEIP:
+#    Type: AWS::EC2::EIPAssociation
+#    Properties:
+  #    AllocationId: eipalloc-f7bc02c9 # must list the EIP OR AllocationId, not both
+#      EIP: 54.176.172.49
+#      InstanceId: !Ref EC2Instance
+
+ # Add role/policy/profile
+  EC2S3Role:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: EC2AccessS3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 's3:ListBucket'
+                Resource: !Join ['', ['arn:aws:s3:::', !Ref "FtS3BucketNameParameter"]]
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:DeleteObject'
+                Resource: !Join ['', ['arn:aws:s3:::', !Ref "FtS3BucketNameParameter",'/*']]
+
+  EC2S3RoleInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2S3Role
+
+  EC2InstanceRecordSetA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue HostedZone1IdExport
+      Name: !Join ['', [!Ref "HostNameParamter", ".", !ImportValue HostedZone1ParameterExport, '.']]
+      Type: A
+      TTL: '60'
+      ResourceRecords:
+      - !GetAtt EC2Instance.PublicIp
+    DependsOn: EC2InstanceEIP
